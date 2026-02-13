@@ -32,28 +32,117 @@ _confirm_deletion(){
   fi
 }
 
+_ensure_sudo_session() {
+  if [ "${SUDO_READY}" -eq 1 ]; then
+    return 0
+  fi
+
+  sudo -H -v || _exit_error "sudo authentication failed"
+  SUDO_READY=1
+}
+
+_count_lines() {
+  local file=$1
+  local count
+  count=$(wc -l < "$file")
+  echo "${count//[[:space:]]/}"
+}
+
+_filter_deletable_paths() {
+  local input_file=$1
+  local deletable_file=$2
+  local alive_file=$3
+  local dead_file
+
+  dead_file=$(mktemp)
+  : > "$deletable_file"
+  : > "$alive_file"
+
+  _ensure_sudo_session
+  sudo -H nix-store --gc --print-dead > "$dead_file" || {
+    rm -f "$dead_file"
+    _exit_error "failed to query dead store paths"
+  }
+
+  awk -v deletable="$deletable_file" -v alive="$alive_file" '
+    NR == FNR {
+      if (NF && !seen[$0]++) {
+        ordered[++count] = $0
+        candidate[$0] = 1
+      }
+      next
+    }
+    ($0 in candidate) {
+      dead[$0] = 1
+    }
+    END {
+      for (i = 1; i <= count; i++) {
+        path = ordered[i]
+        if (path in dead) {
+          print path >> deletable
+        } else {
+          print path >> alive
+        }
+      }
+    }
+  ' "$input_file" "$dead_file"
+
+  rm -f "$dead_file"
+}
+
 _delete_store_paths_from_file() {
   local paths_file=$1
   local path_count
-  path_count=$(wc -l < "$paths_file")
-  path_count=${path_count//[[:space:]]/}
+  local deletable_file
+  local alive_file
+  local deletable_count
+  local alive_count
+
+  path_count=$(_count_lines "$paths_file")
 
   if [ -z "$path_count" ] || [ "$path_count" -eq 0 ]; then
     echo "No matching nix-store paths found."
     return 0
   fi
 
-  echo "The following paths will be deleted (${path_count}):"
-  sed -n '1,20p' "$paths_file"
-  if [ "$path_count" -gt 20 ]; then
-    echo "... and $((path_count - 20)) more"
+  deletable_file=$(mktemp)
+  alive_file=$(mktemp)
+  _filter_deletable_paths "$paths_file" "$deletable_file" "$alive_file"
+
+  deletable_count=$(_count_lines "$deletable_file")
+  alive_count=$(_count_lines "$alive_file")
+
+  if [ "$alive_count" -gt 0 ]; then
+    echo "Skipping ${alive_count} path(s) that are still alive:"
+    sed -n '1,20p' "$alive_file"
+    if [ "$alive_count" -gt 20 ]; then
+      echo "... and $((alive_count - 20)) more"
+    fi
+  fi
+
+  if [ "$deletable_count" -eq 0 ]; then
+    echo "No deletable (dead) nix-store paths found."
+    rm -f "$deletable_file" "$alive_file"
+    return 0
+  fi
+
+  echo "The following dead paths will be deleted (${deletable_count}):"
+  sed -n '1,20p' "$deletable_file"
+  if [ "$deletable_count" -gt 20 ]; then
+    echo "... and $((deletable_count - 20)) more"
   fi
 
   _confirm_deletion
+  _ensure_sudo_session
 
-  xargs -r -n 200 sudo nix-store --delete < "$paths_file"
+  if ! xargs -r -n 200 sudo -H nix-store --delete < "$deletable_file"; then
+    rm -f "$deletable_file" "$alive_file"
+    _exit_error "one or more deletions failed (paths may have become alive again)"
+  fi
 
-  echo "Deleted ${path_count} path(s)."
+  rm -f "$deletable_file" "$alive_file"
+
+  echo "Deleted ${deletable_count} path(s)."
 }
 
 _delete_from_store_path(){
@@ -100,7 +189,8 @@ _nix_cleanup_system() {
   rm -f "$all_paths_file"
 
   # Perform garbage collection to clean up everything
-  sudo nix-collect-garbage -d
+  _ensure_sudo_session
+  sudo -H nix-collect-garbage -d
 }
 
 _cleanup_package() {
@@ -119,7 +209,8 @@ _cleanup_package() {
   _delete_from_store_path "$store_path"
 
   # Perform garbage collection to clean up everything
-  sudo nix-collect-garbage -d
+  _ensure_sudo_session
+  sudo -H nix-collect-garbage -d
 
   echo "Garbage collection complete. Nix store is cleaned up."
 }
@@ -132,7 +223,8 @@ _cleanup_store_paths() {
   _delete_store_paths_from_file "$all_paths_file"
   rm -f "$all_paths_file"
 
-  sudo nix-collect-garbage -d
+  _ensure_sudo_session
+  sudo -H nix-collect-garbage -d
 
   echo "Garbage collection complete. Nix store is cleaned up."
 }
@@ -154,7 +246,8 @@ _cleanup_older_than() {
   _delete_store_paths_from_file "$older_paths_file"
   rm -f "$older_paths_file"
 
-  sudo nix-collect-garbage -d
+  _ensure_sudo_session
+  sudo -H nix-collect-garbage -d
 
   echo "Garbage collection complete. Nix store is cleaned up."
 }
@@ -173,9 +266,10 @@ _all_are_store_paths() {
 export CLEANUP_SYSTEM=0
 OLDER_THAN=""
 POSITIONAL_ARGS=()
+SUDO_READY=0
 
 # Ensure required packages is available
-required_packages=("nix" "nix-store" "nix-collect-garbage" "find" "xargs" "mktemp" "awk")
+required_packages=("nix" "nix-store" "nix-collect-garbage" "find" "xargs" "mktemp" "awk" "wc" "sed")
 for req in "${required_packages[@]}"; do
   if ! type "$req" > /dev/null 2>&1; then
     _exit_error "package required: $req"
