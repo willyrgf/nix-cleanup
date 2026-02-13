@@ -60,7 +60,7 @@ _filter_deletable_paths() {
   : > "$alive_file"
 
   _ensure_sudo_session
-  sudo -H nix-store --gc --print-dead > "$dead_file" || {
+  sudo -H "$NIX_STORE_BIN" --gc --print-dead > "$dead_file" || {
     rm -f "$dead_file"
     _exit_error "failed to query dead store paths"
   }
@@ -160,7 +160,7 @@ _delete_store_paths_from_file() {
     fi
 
     delete_log=$(mktemp)
-    xargs -r -n "$delete_batch_size" sudo -H nix-store --delete < "$pending_file" > "$delete_log" 2>&1 || true
+    xargs -r -n "$delete_batch_size" sudo -H "$NIX_STORE_BIN" --delete < "$pending_file" > "$delete_log" 2>&1 || true
 
     remaining_file=$(mktemp)
     while IFS= read -r path; do
@@ -226,7 +226,7 @@ _delete_from_store_path(){
   referrers_file=$(mktemp)
   all_paths_file=$(mktemp)
 
-  if ! nix-store --query --referrers-closure "$store_path" > "$referrers_file"; then
+  if ! "$NIX_STORE_BIN" --query --referrers-closure "$store_path" > "$referrers_file"; then
     rm -f "$referrers_file" "$all_paths_file"
     _exit_error "store path not found: $store_path"
   fi
@@ -263,7 +263,7 @@ _nix_cleanup_system() {
 
   # Perform garbage collection to clean up everything
   _ensure_sudo_session
-  sudo -H nix-collect-garbage -d
+  sudo -H "$NIX_COLLECT_GARBAGE_BIN" -d
 }
 
 _cleanup_package() {
@@ -272,7 +272,7 @@ _cleanup_package() {
   # Get the store path of the package
   local store_path
 
-  store_path=$(nix path-info ".#$package_name" 2>/dev/null || true)
+  store_path=$("$NIX_BIN" path-info ".#$package_name" 2>/dev/null || true)
   if [ -z "$store_path" ]; then
     echo "Package $package_name not found."
     exit 1
@@ -283,7 +283,7 @@ _cleanup_package() {
 
   # Perform garbage collection to clean up everything
   _ensure_sudo_session
-  sudo -H nix-collect-garbage -d
+  sudo -H "$NIX_COLLECT_GARBAGE_BIN" -d
 
   echo "Garbage collection complete. Nix store is cleaned up."
 }
@@ -297,7 +297,7 @@ _cleanup_store_paths() {
   rm -f "$all_paths_file"
 
   _ensure_sudo_session
-  sudo -H nix-collect-garbage -d
+  sudo -H "$NIX_COLLECT_GARBAGE_BIN" -d
 
   echo "Garbage collection complete. Nix store is cleaned up."
 }
@@ -320,7 +320,7 @@ _cleanup_older_than() {
   rm -f "$older_paths_file"
 
   _ensure_sudo_session
-  sudo -H nix-collect-garbage -d
+  sudo -H "$NIX_COLLECT_GARBAGE_BIN" -d
 
   echo "Garbage collection complete. Nix store is cleaned up."
 }
@@ -348,6 +348,10 @@ for req in "${required_packages[@]}"; do
     _exit_error "package required: $req"
   fi
 done
+
+NIX_BIN=$(command -v nix)
+NIX_STORE_BIN=$(command -v nix-store)
+NIX_COLLECT_GARBAGE_BIN=$(command -v nix-collect-garbage)
 
 while [ $# -gt 0 ]; do
   case "$1" in
