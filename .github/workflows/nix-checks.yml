@@ -2,11 +2,7 @@ name: Nix Checks
 
 on:
   push:
-    paths:
-      - 'flake.nix'
-      - 'flake.lock'
-      - 'nix-cleanup.sh'
-      - '.github/workflows/nix-checks.yml'
+  pull_request:
 
 jobs:
   nix_checks: 
@@ -28,6 +24,43 @@ jobs:
           extra_nix_config: |
             sandbox = true # force sandbox for all OS (normally disabled for macOS)
 
-      - name: Run app
+      - name: Validate shell syntax
+        run: bash -n nix-cleanup.sh
+
+      - name: Validate help output
         run: nix run --print-build-logs --show-trace '.#nix-cleanup' -- --help
 
+      - name: Validate argument parsing
+        run: |
+          set +e
+          nix run --print-build-logs --show-trace '.#nix-cleanup' -- --older-than bad
+          status=$?
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            echo "Expected --older-than bad to fail."
+            exit 1
+          fi
+
+      - name: Delete a disposable store path
+        run: |
+          set -euo pipefail
+
+          tmp_payload="$(mktemp)"
+          trap 'rm -f "$tmp_payload"' EXIT
+          printf 'nix-cleanup-ci-disposable-%s\n' "$(date +%s)" > "$tmp_payload"
+
+          store_path="$(nix-store --add "$tmp_payload")"
+          echo "Created disposable store path: $store_path"
+
+          if [ ! -e "$store_path" ]; then
+            echo "Expected disposable store path to exist before cleanup."
+            exit 1
+          fi
+
+          printf 'y\n' | nix run --print-build-logs --show-trace '.#nix-cleanup' -- "$store_path"
+
+          if [ -e "$store_path" ]; then
+            echo "Store path still exists after cleanup: $store_path"
+            exit 1
+          fi
