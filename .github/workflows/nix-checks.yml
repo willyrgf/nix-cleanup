@@ -46,6 +46,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          nix build --print-build-logs --show-trace '.#nix-cleanup'
+          cleanup_bin="$(pwd)/result/bin/nix-cleanup"
+
+          if [ ! -x "$cleanup_bin" ]; then
+            echo "Expected cleanup binary at $cleanup_bin"
+            exit 1
+          fi
+
           tmp_payload="$(mktemp)"
           trap 'rm -f "$tmp_payload"' EXIT
           printf 'nix-cleanup-ci-disposable-%s\n' "$(date +%s)" > "$tmp_payload"
@@ -58,7 +66,7 @@ jobs:
             exit 1
           fi
 
-          printf 'y\n' | nix run --print-build-logs --show-trace '.#nix-cleanup' -- "$store_path"
+          printf 'y\n' | "$cleanup_bin" "$store_path"
 
           if [ -e "$store_path" ]; then
             echo "Store path still exists after cleanup: $store_path"
