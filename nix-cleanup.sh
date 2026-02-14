@@ -49,6 +49,27 @@ _count_lines() {
   echo "${count//[[:space:]]/}"
 }
 
+_delete_log_has_only_alive_errors() {
+  local log_file=$1
+  local error_lines_file
+
+  error_lines_file=$(mktemp)
+  grep -E '^error:' "$log_file" > "$error_lines_file" || true
+
+  if [ ! -s "$error_lines_file" ]; then
+    rm -f "$error_lines_file"
+    return 1
+  fi
+
+  if grep -Fv "since it is still alive." "$error_lines_file" > /dev/null; then
+    rm -f "$error_lines_file"
+    return 1
+  fi
+
+  rm -f "$error_lines_file"
+  return 0
+}
+
 _filter_deletable_paths() {
   local input_file=$1
   local deletable_file=$2
@@ -195,6 +216,14 @@ _delete_store_paths_from_file() {
       echo "Retrying remaining dead paths one-by-one to resolve referrer ordering..."
       delete_batch_size=1
     elif [ "$deleted_this_pass" -eq 0 ] && [ "$delete_batch_size" -eq 1 ]; then
+      if _delete_log_has_only_alive_errors "$delete_log"; then
+        echo "Some paths became alive during deletion. Skipping remaining paths."
+        cat "$remaining_file" >> "$alive_file"
+        rm -f "$pending_file" "$remaining_file" "$retry_deletable_file" "$retry_alive_file" "$delete_log"
+        pending_file=""
+        break
+      fi
+
       echo "Delete command output (first 20 lines):"
       sed -n '1,20p' "$delete_log"
       rm -f "$pending_file" "$remaining_file" "$retry_deletable_file" "$retry_alive_file" "$delete_log" "$deletable_file" "$alive_file"
@@ -207,7 +236,7 @@ _delete_store_paths_from_file() {
 
   alive_count=$(_count_lines "$alive_file")
   if [ "$deleted_count" -lt "$deletable_count" ]; then
-    echo "Skipped $((deletable_count - deleted_count)) path(s) that were no longer deletable at delete time."
+    echo "Skipped $((deletable_count - deleted_count)) path(s) that were not deletable at delete time."
   fi
 
   if [ -n "$pending_file" ]; then

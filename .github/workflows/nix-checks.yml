@@ -54,11 +54,11 @@ jobs:
             exit 1
           fi
 
-          tmp_payload="$(mktemp)"
-          trap 'rm -f "$tmp_payload"' EXIT
-          printf 'nix-cleanup-ci-disposable-%s\n' "$(date +%s)" > "$tmp_payload"
+          fixture_expr='let pkgs = import <nixpkgs> {}; in pkgs.runCommand "nix-cleanup-ci-fixture" {} "echo fixture > $out"'
+          nix build --print-build-logs --show-trace --impure --out-link ci-gc-fixture --expr "$fixture_expr"
 
-          store_path="$(nix-store --add "$tmp_payload")"
+          store_path="$(readlink -f ci-gc-fixture)"
+          rm -f ci-gc-fixture
           echo "Created disposable store path: $store_path"
 
           if [ ! -e "$store_path" ]; then
@@ -66,9 +66,28 @@ jobs:
             exit 1
           fi
 
-          printf 'y\n' | "$cleanup_bin" "$store_path"
+          echo "Roots before cleanup:"
+          nix-store --query --roots "$store_path" || true
+
+          if ! nix-store --gc --print-dead | grep -Fx "$store_path" > /dev/null; then
+            echo "Fixture store path is not dead before cleanup."
+            exit 1
+          fi
+
+          for attempt in 1 2 3; do
+            printf 'y\n' | "$cleanup_bin" "$store_path"
+            if [ ! -e "$store_path" ]; then
+              break
+            fi
+
+            echo "Store path still exists after attempt $attempt. Current roots:"
+            nix-store --query --roots "$store_path" || true
+            sleep 1
+          done
 
           if [ -e "$store_path" ]; then
             echo "Store path still exists after cleanup: $store_path"
+            echo "Final roots:"
+            nix-store --query --roots "$store_path" || true
             exit 1
           fi
