@@ -12,6 +12,7 @@ nix run 'github:willyrgf/nix-cleanup' -- --help
 
 ```text
 nix-cleanup - clean dead nix store paths safely
+Flake commit: <commit-hash-or-unknown>
 
 Usage:
   nix-cleanup [--yes] [--jobs N] [--quick] [--no-gc|--gc] --system
@@ -20,7 +21,7 @@ Usage:
   nix-cleanup [--yes] [--jobs N] [--quick] [--no-gc|--gc] /nix/store/path ...
   nix-cleanup [--yes] [--jobs N] --gc-only
   nix-cleanup --add-cron COMMAND_OR_CRON_ENTRY
-  nix-cleanup -h | --help
+  nix-cleanup help | -h | --help
 
 Options:
   -y, --yes
@@ -60,6 +61,7 @@ Options:
 - `--quick` with no target defaults to `--system`.
 - `--quick` defaults to `--no-gc`; use `--gc` to force final GC.
 - `--jobs N` lets you scale parallelism up or down.
+- `help` as the first argument behaves like `--help`.
 
 ## Examples
 
@@ -93,11 +95,11 @@ Use `--add-cron` to append to root's crontab:
 - command only (stored as `@daily`):
 
 ```bash
-nix run .#nix-cleanup -- --add-cron "nix-cleanup --older-than 30d --quick"
+nix run .#nix-cleanup -- --add-cron "nix-cleanup --quick --gc --yes --jobs 4"
 ```
 
 - full cron entry:
 
 ```bash
-nix run .#nix-cleanup -- --add-cron "0 3 * * * nix-cleanup --older-than 30d --quick"
+nix run .#nix-cleanup -- --add-cron "0 3 * * * nix-cleanup --quick --gc --yes --jobs 4"
 ```

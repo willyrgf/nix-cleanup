@@ -9,9 +9,28 @@ _arg0() {
   printf '%s\n' "${0##*/}"
 }
 
+_flake_commit() {
+  local commit="${NIX_CLEANUP_FLAKE_COMMIT:-__NIX_CLEANUP_FLAKE_COMMIT__}"
+
+  if [ "$commit" = "__NIX_CLEANUP_FLAKE_COMMIT__" ]; then
+    if command -v git > /dev/null 2>&1; then
+      commit=$(git rev-parse --short=12 HEAD 2>/dev/null || true)
+    else
+      commit=""
+    fi
+  fi
+
+  if [ -z "$commit" ]; then
+    commit="unknown"
+  fi
+
+  printf '%s\n' "$commit"
+}
+
 _help() {
   cat <<EOF
 nix-cleanup - clean dead nix store paths safely
+Flake commit: $(_flake_commit)
 
 Usage:
   $(_arg0) [--yes] [--jobs N] [--quick] [--no-gc|--gc] --system
@@ -20,7 +39,7 @@ Usage:
   $(_arg0) [--yes] [--jobs N] [--quick] [--no-gc|--gc] /nix/store/path ...
   $(_arg0) [--yes] [--jobs N] --gc-only
   $(_arg0) --add-cron COMMAND_OR_CRON_ENTRY
-  $(_arg0) -h | --help
+  $(_arg0) help | -h | --help
 
 Options:
   -y, --yes
@@ -69,7 +88,7 @@ Examples:
   $(_arg0) hello --no-gc
   $(_arg0) /nix/store/hash-a /nix/store/hash-b --quick
   $(_arg0) --gc-only
-  $(_arg0) --add-cron "$(_arg0) --older-than 30d --quick"
+  $(_arg0) --add-cron "$(_arg0) --quick --gc --yes --jobs 4"
 EOF
 }
 
@@ -740,6 +759,11 @@ DELETE_CHUNK_SIZE=128
 MAX_DELETE_WAVES=5
 QUICK_DEFAULTED_SYSTEM=0
 QUICK_DEFAULTED_NO_GC=0
+
+if [ "${1:-}" = "help" ]; then
+  _help
+  exit 0
+fi
 
 while [ $# -gt 0 ]; do
   case "$1" in

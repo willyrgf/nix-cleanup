@@ -8,6 +8,10 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
+        flakeCommit =
+          if self ? rev then self.rev
+          else if self ? dirtyRev then self.dirtyRev
+          else "unknown";
       in
       {
         packages.nix-cleanup = pkgs.stdenv.mkDerivation rec {
@@ -20,7 +24,8 @@
           installPhase = ''
             mkdir -p $out/bin
             substitute ${pname}.sh $out/bin/${pname} \
-              --replace "/usr/bin/env bash" "${pkgs.bash}/bin/bash"
+              --replace "/usr/bin/env bash" "${pkgs.bash}/bin/bash" \
+              --replace "__NIX_CLEANUP_FLAKE_COMMIT__" "${flakeCommit}"
             chmod +x $out/bin/${pname}
           '';
 
@@ -37,4 +42,3 @@
         };
       });
 }
-
