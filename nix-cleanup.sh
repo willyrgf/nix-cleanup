@@ -655,6 +655,11 @@ _valid_cron_entry() {
   local field4
   local field5
   local command
+  local minute_re='^[0-9*/,-]+$'
+  local hour_re='^[0-9*/,-]+$'
+  local day_of_month_re='^[0-9*/,-]+$'
+  local month_re='^[0-9A-Za-z*/,-]+$'
+  local day_of_week_re='^[0-9A-Za-z*/,#-]+$'
 
   if [[ "$cron_entry" =~ ^@[[:alnum:]_-]+[[:space:]]+.+$ ]]; then
     return 0
@@ -662,6 +667,26 @@ _valid_cron_entry() {
 
   read -r field1 field2 field3 field4 field5 command <<< "$cron_entry"
   if [ -z "$field1" ] || [ -z "$field2" ] || [ -z "$field3" ] || [ -z "$field4" ] || [ -z "$field5" ] || [ -z "$command" ]; then
+    return 1
+  fi
+
+  if ! [[ "$field1" =~ $minute_re ]]; then
+    return 1
+  fi
+
+  if ! [[ "$field2" =~ $hour_re ]]; then
+    return 1
+  fi
+
+  if ! [[ "$field3" =~ $day_of_month_re ]]; then
+    return 1
+  fi
+
+  if ! [[ "$field4" =~ $month_re ]]; then
+    return 1
+  fi
+
+  if ! [[ "$field5" =~ $day_of_week_re ]]; then
     return 1
   fi
 
