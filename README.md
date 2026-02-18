@@ -20,7 +20,7 @@ Usage:
   nix-cleanup [--yes] [--jobs N] [--quick] [--no-gc|--gc] flake-pkg-name
   nix-cleanup [--yes] [--jobs N] [--quick] [--no-gc|--gc] /nix/store/path ...
   nix-cleanup [--yes] [--jobs N] --gc-only
-  nix-cleanup --add-cron COMMAND_OR_CRON_ENTRY
+  nix-cleanup --add-cron [COMMAND_OR_CRON_ENTRY]
   nix-cleanup help | -h | --help
 
 Options:
@@ -47,6 +47,7 @@ Options:
       Add an entry to root's crontab (sudo required).
       Full cron entries are installed as-is.
       Plain commands are stored as: @daily <command>.
+      Default command when omitted: nix-cleanup --quick --gc --yes --jobs 4
   -h, --help
       Show this help text.
 ```
@@ -91,6 +92,12 @@ nix run .#nix-cleanup -- --gc-only
 ## Cron setup (requires sudo)
 
 Use `--add-cron` to append to root's crontab:
+
+- default command (stored as `@daily`):
+
+```bash
+nix run .#nix-cleanup -- --add-cron
+```
 
 - command only (stored as `@daily`):
 

@@ -9,6 +9,10 @@ _arg0() {
   printf '%s\n' "${0##*/}"
 }
 
+_default_cron_command() {
+  printf '%s\n' "nix-cleanup --quick --gc --yes --jobs 4"
+}
+
 _flake_commit() {
   local commit="${NIX_CLEANUP_FLAKE_COMMIT:-__NIX_CLEANUP_FLAKE_COMMIT__}"
 
@@ -38,7 +42,7 @@ Usage:
   $(_arg0) [--yes] [--jobs N] [--quick] [--no-gc|--gc] flake-pkg-name
   $(_arg0) [--yes] [--jobs N] [--quick] [--no-gc|--gc] /nix/store/path ...
   $(_arg0) [--yes] [--jobs N] --gc-only
-  $(_arg0) --add-cron COMMAND_OR_CRON_ENTRY
+  $(_arg0) --add-cron [COMMAND_OR_CRON_ENTRY]
   $(_arg0) help | -h | --help
 
 Options:
@@ -65,6 +69,7 @@ Options:
       Add an entry to root's crontab (sudo required).
       Full cron entries are installed as-is.
       Plain commands are stored as: @daily <command>.
+      Default command when omitted: $(_default_cron_command)
   -h, --help
       Show this help text.
 
@@ -88,7 +93,8 @@ Examples:
   $(_arg0) hello --no-gc
   $(_arg0) /nix/store/hash-a /nix/store/hash-b --quick
   $(_arg0) --gc-only
-  $(_arg0) --add-cron "$(_arg0) --quick --gc --yes --jobs 4"
+  $(_arg0) --add-cron
+  $(_arg0) --add-cron "$(_default_cron_command)"
 EOF
 }
 
@@ -822,7 +828,8 @@ while [ $# -gt 0 ]; do
     --add-cron)
       shift
       if [ $# -eq 0 ]; then
-        _exit_error "--add-cron requires a command or cron entry"
+        ADD_CRON_ENTRY=$(_default_cron_command)
+        break
       fi
       ADD_CRON_ENTRY="$*"
       break
@@ -830,7 +837,7 @@ while [ $# -gt 0 ]; do
     --add-cron=*)
       ADD_CRON_ENTRY="${1#*=}"
       if [ -z "$ADD_CRON_ENTRY" ]; then
-        _exit_error "--add-cron requires a command or cron entry"
+        ADD_CRON_ENTRY=$(_default_cron_command)
       fi
       shift
       ;;
