@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
 
-_exit_error(){
-  echo "ERROR: $@"
+_exit_error() {
+  echo "ERROR: $*"
   exit 1
 }
 
-_arg0(){
-  echo -n "$0" | grep -Eo '([a-z]+[-.]?){1,}$'
+_arg0() {
+  printf '%s\n' "${0##*/}"
 }
 
-_help(){
+_help() {
   cat <<EOF
 nix-cleanup - clean dead nix store paths safely
 
 Usage:
-  $(_arg0) [--yes] [--system]
-  $(_arg0) [--yes] [--older-than 30d]
-  $(_arg0) [--yes] [flake-pkg-name]
-  $(_arg0) [--yes] [/nix/store/path ...]
+  $(_arg0) [--yes] [--jobs N] [--quick] [--no-gc|--gc] --system
+  $(_arg0) [--yes] [--jobs N] [--quick] [--no-gc|--gc] --older-than 30d
+  $(_arg0) [--yes] [--jobs N] [--quick] [--no-gc|--gc] flake-pkg-name
+  $(_arg0) [--yes] [--jobs N] [--quick] [--no-gc|--gc] /nix/store/path ...
+  $(_arg0) [--yes] [--jobs N] --gc-only
   $(_arg0) --add-cron COMMAND_OR_CRON_ENTRY
   $(_arg0) -h | --help
 
@@ -25,10 +26,22 @@ Options:
   -y, --yes
       Skip deletion confirmation prompts.
   --system
-      Clean the whole nix store state.
+      Clean all currently dead nix-store paths discovered from /nix/store.
   --older-than <duration>
-      Clean store paths older than the provided duration.
+      Clean dead store paths older than the provided duration.
       Format: <number>d (example: 30d).
+  --quick
+      One-pass fast cleanup. Deletes dead paths once and skips retry waves.
+      Defaults to --system and --no-gc unless target/gc mode is specified.
+  --jobs <N>
+      Parallel worker count for path filtering and deletion.
+      Default: auto (between 4 and 32 based on CPU count).
+  --no-gc
+      Skip final 'nix-collect-garbage -d'.
+  --gc
+      Force final 'nix-collect-garbage -d' (overrides --quick default).
+  --gc-only
+      Run only 'nix-collect-garbage -d'.
   --add-cron <command-or-cron-entry>
       Add an entry to root's crontab (sudo required).
       Full cron entries are installed as-is.
@@ -43,97 +56,161 @@ Arguments:
       Clean one or more explicit nix store paths.
 
 Notes:
-  - --add-cron cannot be combined with cleanup options or arguments.
-  - --older-than cannot be combined with package/store path arguments.
-  - Non --system cleanup prompts for confirmation before deleting.
+  - Pick exactly one target selector: --system, --older-than, --gc-only,
+    a package name, or one/more /nix/store/path values.
+  - --quick is safe-by-construction: only dead paths are targeted.
+  - --quick defaults to --system and --no-gc when not explicitly set.
 
 Examples:
-  $(_arg0) --older-than 30d
-  $(_arg0) hello
-  $(_arg0) /nix/store/hash-a /nix/store/hash-b
-  $(_arg0) --add-cron "$(_arg0) --older-than 30d"
-  $(_arg0) --add-cron "0 3 * * * $(_arg0) --older-than 30d"
+  $(_arg0) --older-than 30d --quick
+  $(_arg0) --quick
+  $(_arg0) --system --jobs 16
+  $(_arg0) --quick --gc
+  $(_arg0) hello --no-gc
+  $(_arg0) /nix/store/hash-a /nix/store/hash-b --quick
+  $(_arg0) --gc-only
+  $(_arg0) --add-cron "$(_arg0) --older-than 30d --quick"
 EOF
-}
-
-_confirm_deletion(){
-  if [ "${ASSUME_YES}" -eq 1 ]; then
-    return 0
-  fi
-
-  if [ "${CLEANUP_SYSTEM}" -ne 1 ]; then
-    read -r -p "Are you sure you want to delete these paths? (y/N): " reply
-    if [[ ! "$reply" =~ ^[Yy]$ ]]; then
-      echo "Aborting."
-      exit 1
-    fi
-  fi
-}
-
-_ensure_sudo_session() {
-  if [ "${SUDO_READY}" -eq 1 ]; then
-    return 0
-  fi
-
-  # `sudo -H` is valid for command execution, but not for `-v` on all sudo versions.
-  sudo -v || _exit_error "sudo authentication failed"
-  SUDO_READY=1
 }
 
 _count_lines() {
   local file=$1
   local count
+
+  if [ ! -f "$file" ]; then
+    echo "0"
+    return
+  fi
+
   count=$(wc -l < "$file")
   echo "${count//[[:space:]]/}"
 }
 
-_delete_log_has_only_alive_errors() {
-  local log_file=$1
-  local error_lines_file
-
-  error_lines_file=$(mktemp)
-  grep -E '^error:' "$log_file" > "$error_lines_file" || true
-
-  if [ ! -s "$error_lines_file" ]; then
-    rm -f "$error_lines_file"
-    return 1
-  fi
-
-  if grep -Fv "since it is still alive." "$error_lines_file" > /dev/null; then
-    rm -f "$error_lines_file"
-    return 1
-  fi
-
-  rm -f "$error_lines_file"
-  return 0
+_now_epoch() {
+  date +%s
 }
 
-_filter_deletable_paths() {
-  local input_file=$1
-  local deletable_file=$2
-  local alive_file=$3
-  local dead_file
+_dedupe_file_inplace() {
+  local file=$1
+  local tmp
 
-  dead_file=$(mktemp)
+  tmp=$(mktemp)
+  awk 'NF && !seen[$0]++' "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+_print_preview() {
+  local label=$1
+  local file=$2
+  local count
+
+  count=$(_count_lines "$file")
+  if [ "$count" -eq 0 ]; then
+    return
+  fi
+
+  echo "$label (${count}):"
+  sed -n '1,20p' "$file"
+  if [ "$count" -gt 20 ]; then
+    echo "... and $((count - 20)) more"
+  fi
+}
+
+_confirm_deletion() {
+  local count=$1
+  local reply
+
+  if [ "$ASSUME_YES" -eq 1 ]; then
+    return 0
+  fi
+
+  read -r -p "Delete ${count} dead path(s)? (y/N): " reply
+  if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+    echo "Aborting."
+    exit 1
+  fi
+}
+
+_ensure_sudo_session() {
+  if [ "$SUDO_READY" -eq 1 ]; then
+    return 0
+  fi
+
+  sudo -v || _exit_error "sudo authentication failed"
+  SUDO_READY=1
+}
+
+_cpu_count() {
+  local count
+
+  count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+  if [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -gt 0 ]; then
+    echo "$count"
+    return
+  fi
+
+  echo "4"
+}
+
+_default_jobs() {
+  local cpu
+  local jobs
+
+  cpu=$(_cpu_count)
+  jobs=$cpu
+
+  if [ "$jobs" -lt 4 ]; then
+    jobs=4
+  fi
+
+  if [ "$jobs" -gt 32 ]; then
+    jobs=32
+  fi
+
+  echo "$jobs"
+}
+
+_duration_to_days() {
+  local duration=$1
+
+  if [[ "$duration" =~ ^([0-9]+)d$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  return 1
+}
+
+_list_dead_paths() {
+  local output_file=$1
+
+  : > "$output_file"
+  _ensure_sudo_session
+  if ! sudo -H "$NIX_STORE_BIN" --gc --print-dead > "$output_file"; then
+    _exit_error "failed to query dead store paths"
+  fi
+
+  _dedupe_file_inplace "$output_file"
+}
+
+_classify_paths_against_dead() {
+  local candidates_file=$1
+  local dead_file=$2
+  local deletable_file=$3
+  local alive_file=$4
+
   : > "$deletable_file"
   : > "$alive_file"
 
-  _ensure_sudo_session
-  sudo -H "$NIX_STORE_BIN" --gc --print-dead > "$dead_file" || {
-    rm -f "$dead_file"
-    _exit_error "failed to query dead store paths"
-  }
-
   awk -v deletable="$deletable_file" -v alive="$alive_file" '
     NR == FNR {
-      if (NF && !seen[$0]++) {
-        ordered[++count] = $0
-        candidate[$0] = 1
+      if (NF) {
+        dead[$0] = 1
       }
       next
     }
-    ($0 in candidate) {
-      dead[$0] = 1
+    NF && !seen[$0]++ {
+      ordered[++count] = $0
     }
     END {
       for (i = 1; i <= count; i++) {
@@ -145,72 +222,121 @@ _filter_deletable_paths() {
         }
       }
     }
-  ' "$input_file" "$dead_file"
-
-  rm -f "$dead_file"
+  ' "$dead_file" "$candidates_file"
 }
 
-_delete_store_paths_from_file() {
-  local paths_file=$1
-  local path_count
-  local deletable_file
-  local alive_file
-  local deletable_count
-  local alive_count
-  local pending_file
-  local remaining_file
-  local retry_deletable_file
-  local retry_alive_file
-  local delete_log
+_collect_existing_paths() {
+  local input_file=$1
+  local output_file=$2
+
+  : > "$output_file"
+  if [ ! -s "$input_file" ]; then
+    return
+  fi
+
+  xargs -r -n 256 -P "$JOBS" find -maxdepth 0 -print < "$input_file" > "$output_file" 2>/dev/null || true
+  _dedupe_file_inplace "$output_file"
+}
+
+_delete_batch() {
+  local input_file=$1
+  local chunk_size=$2
+  local log_file=$3
+
+  : > "$log_file"
+  xargs -r -n "$chunk_size" -P "$JOBS" sudo -H "$NIX_STORE_BIN" --delete < "$input_file" > "$log_file" 2>&1 || true
+}
+
+DELETE_RESULT_DELETED=0
+DELETE_RESULT_UNRESOLVED=0
+DELETE_RESULT_UNRESOLVED_FILE=""
+
+_delete_quick() {
+  local deletable_file=$1
+  local alive_file=$2
   local pending_count
+  local log_file
+  local remaining_file
   local remaining_count
-  local retry_deletable_count
-  local deleted_this_pass
-  local deleted_count
-  local delete_batch_size
-  local path
+  local dead_snapshot
+  local retry_dead
+  local retry_alive
 
-  path_count=$(_count_lines "$paths_file")
+  DELETE_RESULT_DELETED=0
+  DELETE_RESULT_UNRESOLVED=0
+  DELETE_RESULT_UNRESOLVED_FILE=""
 
-  if [ -z "$path_count" ] || [ "$path_count" -eq 0 ]; then
-    echo "No matching nix-store paths found."
-    return 0
+  pending_count=$(_count_lines "$deletable_file")
+  if [ "$pending_count" -eq 0 ]; then
+    return
   fi
 
-  deletable_file=$(mktemp)
-  alive_file=$(mktemp)
-  _filter_deletable_paths "$paths_file" "$deletable_file" "$alive_file"
-
-  deletable_count=$(_count_lines "$deletable_file")
-  alive_count=$(_count_lines "$alive_file")
-
-  if [ "$alive_count" -gt 0 ]; then
-    echo "Skipping ${alive_count} path(s) that are still alive:"
-    sed -n '1,20p' "$alive_file"
-    if [ "$alive_count" -gt 20 ]; then
-      echo "... and $((alive_count - 20)) more"
-    fi
-  fi
-
-  if [ "$deletable_count" -eq 0 ]; then
-    echo "No deletable (dead) nix-store paths found."
-    rm -f "$deletable_file" "$alive_file"
-    return 0
-  fi
-
-  echo "The following dead paths will be deleted (${deletable_count}):"
-  sed -n '1,20p' "$deletable_file"
-  if [ "$deletable_count" -gt 20 ]; then
-    echo "... and $((deletable_count - 20)) more"
-  fi
-
-  _confirm_deletion
   _ensure_sudo_session
+
+  log_file=$(mktemp)
+  _delete_batch "$deletable_file" "$DELETE_CHUNK_SIZE" "$log_file"
+
+  remaining_file=$(mktemp)
+  _collect_existing_paths "$deletable_file" "$remaining_file"
+  remaining_count=$(_count_lines "$remaining_file")
+  DELETE_RESULT_DELETED=$((pending_count - remaining_count))
+
+  if [ "$remaining_count" -gt 0 ]; then
+    dead_snapshot=$(mktemp)
+    retry_dead=$(mktemp)
+    retry_alive=$(mktemp)
+
+    _list_dead_paths "$dead_snapshot"
+    _classify_paths_against_dead "$remaining_file" "$dead_snapshot" "$retry_dead" "$retry_alive"
+    cat "$retry_alive" >> "$alive_file"
+    _dedupe_file_inplace "$alive_file"
+
+    DELETE_RESULT_UNRESOLVED=$(_count_lines "$retry_dead")
+    if [ "$DELETE_RESULT_UNRESOLVED" -gt 0 ]; then
+      DELETE_RESULT_UNRESOLVED_FILE=$(mktemp)
+      cp "$retry_dead" "$DELETE_RESULT_UNRESOLVED_FILE"
+    fi
+
+    rm -f "$dead_snapshot" "$retry_dead" "$retry_alive"
+  fi
+
+  if [ -s "$log_file" ] && [ "$DELETE_RESULT_UNRESOLVED" -gt 0 ]; then
+    echo "Delete output (first 20 lines):"
+    sed -n '1,20p' "$log_file"
+  fi
+
+  rm -f "$remaining_file" "$log_file"
+}
+
+_delete_iterative() {
+  local deletable_file=$1
+  local alive_file=$2
+  local pending_file
+  local wave
+  local chunk
+  local no_progress
+  local pending_count
+  local log_file
+  local remaining_file
+  local remaining_count
+  local deleted_this
+  local dead_snapshot
+  local retry_dead
+  local retry_alive
+  local retry_count
+
+  DELETE_RESULT_DELETED=0
+  DELETE_RESULT_UNRESOLVED=0
+  DELETE_RESULT_UNRESOLVED_FILE=""
 
   pending_file=$(mktemp)
   cp "$deletable_file" "$pending_file"
-  deleted_count=0
-  delete_batch_size=200
+
+  wave=1
+  chunk=$DELETE_CHUNK_SIZE
+  no_progress=0
+
+  _ensure_sudo_session
 
   while :; do
     pending_count=$(_count_lines "$pending_file")
@@ -218,105 +344,282 @@ _delete_store_paths_from_file() {
       break
     fi
 
-    delete_log=$(mktemp)
-    xargs -r -n "$delete_batch_size" sudo -H "$NIX_STORE_BIN" --delete < "$pending_file" > "$delete_log" 2>&1 || true
+    if [ "$wave" -gt "$MAX_DELETE_WAVES" ]; then
+      echo "Reached max delete waves (${MAX_DELETE_WAVES}); stopping retries."
+      break
+    fi
+
+    echo "Deletion wave ${wave}: ${pending_count} path(s), jobs=${JOBS}, chunk=${chunk}."
+
+    log_file=$(mktemp)
+    _delete_batch "$pending_file" "$chunk" "$log_file"
 
     remaining_file=$(mktemp)
-    while IFS= read -r path; do
-      if [ -e "$path" ]; then
-        printf '%s\n' "$path" >> "$remaining_file"
-      fi
-    done < "$pending_file"
-
+    _collect_existing_paths "$pending_file" "$remaining_file"
     remaining_count=$(_count_lines "$remaining_file")
-    deleted_this_pass=$((pending_count - remaining_count))
-    deleted_count=$((deleted_count + deleted_this_pass))
+    deleted_this=$((pending_count - remaining_count))
+    DELETE_RESULT_DELETED=$((DELETE_RESULT_DELETED + deleted_this))
 
     if [ "$remaining_count" -eq 0 ]; then
-      rm -f "$pending_file" "$remaining_file" "$delete_log"
-      pending_file=""
+      rm -f "$log_file" "$remaining_file"
+      : > "$pending_file"
       break
     fi
 
-    retry_deletable_file=$(mktemp)
-    retry_alive_file=$(mktemp)
-    _filter_deletable_paths "$remaining_file" "$retry_deletable_file" "$retry_alive_file"
-    cat "$retry_alive_file" >> "$alive_file"
-    retry_deletable_count=$(_count_lines "$retry_deletable_file")
+    dead_snapshot=$(mktemp)
+    retry_dead=$(mktemp)
+    retry_alive=$(mktemp)
 
-    if [ "$retry_deletable_count" -eq 0 ]; then
-      rm -f "$pending_file" "$remaining_file" "$retry_deletable_file" "$retry_alive_file" "$delete_log"
-      pending_file=""
+    _list_dead_paths "$dead_snapshot"
+    _classify_paths_against_dead "$remaining_file" "$dead_snapshot" "$retry_dead" "$retry_alive"
+    cat "$retry_alive" >> "$alive_file"
+    _dedupe_file_inplace "$alive_file"
+
+    retry_count=$(_count_lines "$retry_dead")
+
+    rm -f "$dead_snapshot" "$remaining_file" "$retry_alive"
+
+    if [ "$retry_count" -eq 0 ]; then
+      rm -f "$log_file" "$retry_dead"
+      : > "$pending_file"
       break
     fi
 
-    if [ "$deleted_this_pass" -eq 0 ] && [ "$delete_batch_size" -gt 1 ]; then
-      echo "Retrying remaining dead paths one-by-one to resolve referrer ordering..."
-      delete_batch_size=1
-    elif [ "$deleted_this_pass" -eq 0 ] && [ "$delete_batch_size" -eq 1 ]; then
-      if _delete_log_has_only_alive_errors "$delete_log"; then
-        echo "Some paths became alive during deletion. Skipping remaining paths."
-        cat "$remaining_file" >> "$alive_file"
-        rm -f "$pending_file" "$remaining_file" "$retry_deletable_file" "$retry_alive_file" "$delete_log"
-        pending_file=""
-        break
+    if [ "$deleted_this" -eq 0 ]; then
+      if [ "$chunk" -gt 1 ]; then
+        chunk=1
+        echo "No progress in wave ${wave}; retrying unresolved paths one-by-one."
+      else
+        no_progress=$((no_progress + 1))
       fi
-
-      echo "Delete command output (first 20 lines):"
-      sed -n '1,20p' "$delete_log"
-      rm -f "$pending_file" "$remaining_file" "$retry_deletable_file" "$retry_alive_file" "$delete_log" "$deletable_file" "$alive_file"
-      _exit_error "failed to delete some dead paths (check nix-store roots/referrers)"
+    else
+      no_progress=0
     fi
 
-    rm -f "$pending_file" "$remaining_file" "$retry_alive_file" "$delete_log"
-    pending_file="$retry_deletable_file"
+    rm -f "$pending_file" "$log_file"
+    pending_file="$retry_dead"
+
+    if [ "$no_progress" -ge 1 ]; then
+      echo "No progress after one-by-one retries; stopping."
+      break
+    fi
+
+    wave=$((wave + 1))
   done
 
-  alive_count=$(_count_lines "$alive_file")
-  if [ "$deleted_count" -lt "$deletable_count" ]; then
-    echo "Skipped $((deletable_count - deleted_count)) path(s) that were not deletable at delete time."
+  DELETE_RESULT_UNRESOLVED=$(_count_lines "$pending_file")
+  if [ "$DELETE_RESULT_UNRESOLVED" -gt 0 ]; then
+    DELETE_RESULT_UNRESOLVED_FILE=$(mktemp)
+    cp "$pending_file" "$DELETE_RESULT_UNRESOLVED_FILE"
   fi
 
-  if [ -n "$pending_file" ]; then
-    rm -f "$pending_file"
-  fi
-  rm -f "$deletable_file" "$alive_file"
-
-  echo "Deleted ${deleted_count} path(s)."
+  rm -f "$pending_file"
 }
 
-_delete_from_store_path(){
-  local store_path=$1
+_run_gc() {
+  _ensure_sudo_session
+  sudo -H "$NIX_COLLECT_GARBAGE_BIN" -d
+}
+
+_candidates_system() {
+  local output_file=$1
+
+  echo "Discovering candidates from /nix/store..."
+  find /nix/store -mindepth 1 -maxdepth 1 -print > "$output_file"
+  _dedupe_file_inplace "$output_file"
+}
+
+_candidates_older_than() {
+  local older_than=$1
+  local output_file=$2
+  local days
+  local dead_file
+
+  if ! days=$(_duration_to_days "$older_than"); then
+    _exit_error "--older-than expects the format <number>d (example: 30d)"
+  fi
+
+  dead_file=$(mktemp)
+  _list_dead_paths "$dead_file"
+
+  : > "$output_file"
+  if [ -s "$dead_file" ]; then
+    echo "Discovering dead candidates older than ${older_than}..."
+    xargs -r -n 64 -P "$JOBS" find -maxdepth 0 -mtime +"$days" -print < "$dead_file" > "$output_file" 2>/dev/null || true
+    _dedupe_file_inplace "$output_file"
+  fi
+
+  rm -f "$dead_file"
+}
+
+_candidates_store_paths() {
+  local output_file=$1
+  shift
+
+  printf '%s\n' "$@" | awk 'NF && !seen[$0]++' > "$output_file"
+}
+
+_candidates_package() {
+  local package_name=$1
+  local output_file=$2
+  local store_path
   local referrers_file
-  local all_paths_file
+
+  store_path=$("$NIX_BIN" path-info ".#$package_name" 2>/dev/null || true)
+  if [ -z "$store_path" ]; then
+    _exit_error "package not found: $package_name"
+  fi
 
   referrers_file=$(mktemp)
-  all_paths_file=$(mktemp)
-
   if ! "$NIX_STORE_BIN" --query --referrers-closure "$store_path" > "$referrers_file"; then
-    rm -f "$referrers_file" "$all_paths_file"
+    rm -f "$referrers_file"
     _exit_error "store path not found: $store_path"
   fi
 
   {
     printf '%s\n' "$store_path"
     cat "$referrers_file"
-  } | awk 'NF && !seen[$0]++' > "$all_paths_file"
+  } | awk 'NF && !seen[$0]++' > "$output_file"
 
-  _delete_store_paths_from_file "$all_paths_file"
-
-  rm -f "$referrers_file" "$all_paths_file"
+  rm -f "$referrers_file"
 }
 
-_duration_to_days(){
-  local duration=$1
+_run_cleanup_pipeline() {
+  local candidates_file=$1
+  local discovery_seconds=$2
+  local total_start
+  local total_end
+  local classify_start
+  local classify_end
+  local delete_start
+  local delete_end
+  local gc_start
+  local gc_end
+  local gc_seconds
+  local classify_seconds
+  local delete_seconds
+  local total_seconds
+  local candidate_count
+  local dead_snapshot
+  local deletable_file
+  local alive_file
+  local alive_count
+  local deletable_count
 
-  if [[ "$duration" =~ ^([0-9]+)d$ ]]; then
-    printf '%s\n' "${BASH_REMATCH[1]}"
+  total_start=$(_now_epoch)
+  gc_seconds=0
+
+  candidate_count=$(_count_lines "$candidates_file")
+  echo "Found ${candidate_count} candidate path(s)."
+
+  if [ "$candidate_count" -eq 0 ]; then
+    if [ "$RUN_GC" -eq 1 ]; then
+      gc_start=$(_now_epoch)
+      _run_gc
+      gc_end=$(_now_epoch)
+      gc_seconds=$((gc_end - gc_start))
+    fi
+
+    total_end=$(_now_epoch)
+    total_seconds=$((total_end - total_start))
+
+    echo "No matching nix-store paths found."
+    echo "Summary: candidates=0 alive_skipped=0 deleted=0 unresolved=0"
+    echo "Timing (s): discovery=${discovery_seconds} classify=0 delete=0 gc=${gc_seconds} total=${total_seconds}"
     return 0
   fi
 
-  return 1
+  dead_snapshot=$(mktemp)
+  deletable_file=$(mktemp)
+  alive_file=$(mktemp)
+
+  classify_start=$(_now_epoch)
+  _list_dead_paths "$dead_snapshot"
+  _classify_paths_against_dead "$candidates_file" "$dead_snapshot" "$deletable_file" "$alive_file"
+  classify_end=$(_now_epoch)
+  classify_seconds=$((classify_end - classify_start))
+
+  alive_count=$(_count_lines "$alive_file")
+  deletable_count=$(_count_lines "$deletable_file")
+
+  if [ "$alive_count" -gt 0 ]; then
+    _print_preview "Skipping paths that are still alive" "$alive_file"
+  fi
+
+  if [ "$deletable_count" -eq 0 ]; then
+    echo "No deletable (dead) nix-store paths found."
+
+    if [ "$RUN_GC" -eq 1 ]; then
+      gc_start=$(_now_epoch)
+      _run_gc
+      gc_end=$(_now_epoch)
+      gc_seconds=$((gc_end - gc_start))
+    fi
+
+    total_end=$(_now_epoch)
+    total_seconds=$((total_end - total_start))
+
+    echo "Summary: candidates=${candidate_count} alive_skipped=${alive_count} deleted=0 unresolved=0"
+    echo "Timing (s): discovery=${discovery_seconds} classify=${classify_seconds} delete=0 gc=${gc_seconds} total=${total_seconds}"
+
+    rm -f "$dead_snapshot" "$deletable_file" "$alive_file"
+    return 0
+  fi
+
+  _print_preview "Dead paths targeted for deletion" "$deletable_file"
+
+  if [ "$QUICK_MODE" -eq 1 ]; then
+    echo "Quick mode enabled: one-pass deletion, no retry waves."
+  fi
+
+  _confirm_deletion "$deletable_count"
+
+  delete_start=$(_now_epoch)
+  if [ "$QUICK_MODE" -eq 1 ]; then
+    _delete_quick "$deletable_file" "$alive_file"
+  else
+    _delete_iterative "$deletable_file" "$alive_file"
+  fi
+  delete_end=$(_now_epoch)
+  delete_seconds=$((delete_end - delete_start))
+
+  _dedupe_file_inplace "$alive_file"
+  alive_count=$(_count_lines "$alive_file")
+
+  if [ "$DELETE_RESULT_UNRESOLVED" -gt 0 ]; then
+    _print_preview "Unresolved dead paths (skipped)" "$DELETE_RESULT_UNRESOLVED_FILE"
+  fi
+
+  if [ "$RUN_GC" -eq 1 ]; then
+    gc_start=$(_now_epoch)
+    _run_gc
+    gc_end=$(_now_epoch)
+    gc_seconds=$((gc_end - gc_start))
+  fi
+
+  total_end=$(_now_epoch)
+  total_seconds=$((total_end - total_start))
+
+  echo "Deleted ${DELETE_RESULT_DELETED} path(s)."
+  echo "Summary: candidates=${candidate_count} alive_skipped=${alive_count} deleted=${DELETE_RESULT_DELETED} unresolved=${DELETE_RESULT_UNRESOLVED}"
+  echo "Timing (s): discovery=${discovery_seconds} classify=${classify_seconds} delete=${delete_seconds} gc=${gc_seconds} total=${total_seconds}"
+
+  rm -f "$dead_snapshot" "$deletable_file" "$alive_file"
+  if [ -n "$DELETE_RESULT_UNRESOLVED_FILE" ] && [ -f "$DELETE_RESULT_UNRESOLVED_FILE" ]; then
+    rm -f "$DELETE_RESULT_UNRESOLVED_FILE"
+  fi
+}
+
+_all_are_store_paths() {
+  local value
+
+  for value in "$@"; do
+    if [[ "$value" != /nix/store/* ]]; then
+      return 1
+    fi
+  done
+
+  return 0
 }
 
 _valid_cron_entry() {
@@ -398,101 +701,22 @@ _add_cron_entry() {
   echo "$cron_entry"
 }
 
-_nix_cleanup_system() {
-  local all_paths_file
-  all_paths_file=$(mktemp)
+_required_packages=(
+  "nix"
+  "nix-store"
+  "nix-collect-garbage"
+  "find"
+  "xargs"
+  "mktemp"
+  "awk"
+  "wc"
+  "sed"
+  "date"
+  "getconf"
+)
 
-  echo "Indexing and deleting all nix-store paths..."
-  find /nix/store -mindepth 1 -maxdepth 1 -print > "$all_paths_file"
-  _delete_store_paths_from_file "$all_paths_file"
-  rm -f "$all_paths_file"
-
-  # Perform garbage collection to clean up everything
-  _ensure_sudo_session
-  sudo -H "$NIX_COLLECT_GARBAGE_BIN" -d
-}
-
-_cleanup_package() {
-  local package_name=$1
-
-  # Get the store path of the package
-  local store_path
-
-  store_path=$("$NIX_BIN" path-info ".#$package_name" 2>/dev/null || true)
-  if [ -z "$store_path" ]; then
-    echo "Package $package_name not found."
-    exit 1
-  fi
-
-  echo "Found store path: $store_path"
-  _delete_from_store_path "$store_path"
-
-  # Perform garbage collection to clean up everything
-  _ensure_sudo_session
-  sudo -H "$NIX_COLLECT_GARBAGE_BIN" -d
-
-  echo "Garbage collection complete. Nix store is cleaned up."
-}
-
-_cleanup_store_paths() {
-  local all_paths_file
-  all_paths_file=$(mktemp)
-
-  printf '%s\n' "$@" | awk 'NF && !seen[$0]++' > "$all_paths_file"
-  _delete_store_paths_from_file "$all_paths_file"
-  rm -f "$all_paths_file"
-
-  _ensure_sudo_session
-  sudo -H "$NIX_COLLECT_GARBAGE_BIN" -d
-
-  echo "Garbage collection complete. Nix store is cleaned up."
-}
-
-_cleanup_older_than() {
-  local older_than=$1
-  local days
-  local older_paths_file
-
-  if ! days=$(_duration_to_days "$older_than"); then
-    _exit_error "--older-than expects the format <number>d (example: 30d)"
-  fi
-
-  older_paths_file=$(mktemp)
-
-  echo "Indexing nix-store paths older than ${older_than}..."
-  find /nix/store -mindepth 1 -maxdepth 1 -mtime +"$days" -print > "$older_paths_file"
-
-  _delete_store_paths_from_file "$older_paths_file"
-  rm -f "$older_paths_file"
-
-  _ensure_sudo_session
-  sudo -H "$NIX_COLLECT_GARBAGE_BIN" -d
-
-  echo "Garbage collection complete. Nix store is cleaned up."
-}
-
-_all_are_store_paths() {
-  local value
-  for value in "$@"; do
-    if [[ "$value" != /nix/store/* ]]; then
-      return 1
-    fi
-  done
-
-  return 0
-}
-
-export CLEANUP_SYSTEM=0
-OLDER_THAN=""
-ADD_CRON_ENTRY=""
-ASSUME_YES=0
-POSITIONAL_ARGS=()
-SUDO_READY=0
-
-# Ensure required packages is available
-required_packages=("nix" "nix-store" "nix-collect-garbage" "find" "xargs" "mktemp" "awk" "wc" "sed")
-for req in "${required_packages[@]}"; do
-  if ! type "$req" > /dev/null 2>&1; then
+for req in "${_required_packages[@]}"; do
+  if ! command -v "$req" > /dev/null 2>&1; then
     _exit_error "package required: $req"
   fi
 done
@@ -500,6 +724,22 @@ done
 NIX_BIN=$(command -v nix)
 NIX_STORE_BIN=$(command -v nix-store)
 NIX_COLLECT_GARBAGE_BIN=$(command -v nix-collect-garbage)
+
+CLEANUP_SYSTEM=0
+OLDER_THAN=""
+ADD_CRON_ENTRY=""
+ASSUME_YES=0
+POSITIONAL_ARGS=()
+SUDO_READY=0
+QUICK_MODE=0
+RUN_GC=1
+GC_ONLY=0
+GC_MODE_SET=0
+JOBS=""
+DELETE_CHUNK_SIZE=128
+MAX_DELETE_WAVES=5
+QUICK_DEFAULTED_SYSTEM=0
+QUICK_DEFAULTED_NO_GC=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -524,6 +764,35 @@ while [ $# -gt 0 ]; do
       ;;
     --older-than=*)
       OLDER_THAN="${1#*=}"
+      shift
+      ;;
+    --quick)
+      QUICK_MODE=1
+      shift
+      ;;
+    --jobs)
+      if [ -z "${2:-}" ]; then
+        _exit_error "--jobs requires a value"
+      fi
+      JOBS="$2"
+      shift 2
+      ;;
+    --jobs=*)
+      JOBS="${1#*=}"
+      shift
+      ;;
+    --no-gc)
+      RUN_GC=0
+      GC_MODE_SET=1
+      shift
+      ;;
+    --gc)
+      RUN_GC=1
+      GC_MODE_SET=1
+      shift
+      ;;
+    --gc-only)
+      GC_ONLY=1
       shift
       ;;
     --add-cron)
@@ -558,12 +827,60 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -n "$OLDER_THAN" ] && [ "${#POSITIONAL_ARGS[@]}" -gt 0 ]; then
-  _exit_error "--older-than cannot be combined with package/store path arguments"
+if [ -n "$JOBS" ] && [[ ! "$JOBS" =~ ^[0-9]+$ || "$JOBS" -lt 1 ]]; then
+  _exit_error "--jobs expects a positive integer"
 fi
 
-if [ -n "$ADD_CRON_ENTRY" ] && { [ "$CLEANUP_SYSTEM" -eq 1 ] || [ -n "$OLDER_THAN" ] || [ "${#POSITIONAL_ARGS[@]}" -gt 0 ]; }; then
+if [ -z "$JOBS" ]; then
+  JOBS=$(_default_jobs)
+fi
+
+if [ "$GC_ONLY" -eq 1 ] && [ "$RUN_GC" -eq 0 ]; then
+  _exit_error "--gc-only cannot be combined with --no-gc"
+fi
+
+if [ -n "$ADD_CRON_ENTRY" ] && { [ "$CLEANUP_SYSTEM" -eq 1 ] || [ -n "$OLDER_THAN" ] || [ "$GC_ONLY" -eq 1 ] || [ "${#POSITIONAL_ARGS[@]}" -gt 0 ] || [ "$QUICK_MODE" -eq 1 ] || [ "$GC_MODE_SET" -eq 1 ]; }; then
   _exit_error "--add-cron cannot be combined with cleanup options/arguments"
+fi
+
+selector_count=0
+if [ "$CLEANUP_SYSTEM" -eq 1 ]; then
+  selector_count=$((selector_count + 1))
+fi
+if [ -n "$OLDER_THAN" ]; then
+  selector_count=$((selector_count + 1))
+fi
+if [ "$GC_ONLY" -eq 1 ]; then
+  selector_count=$((selector_count + 1))
+fi
+if [ "${#POSITIONAL_ARGS[@]}" -gt 0 ]; then
+  selector_count=$((selector_count + 1))
+fi
+
+if [ "$selector_count" -gt 1 ]; then
+  _exit_error "pick exactly one target selector: --system, --older-than, --gc-only, package name, or /nix/store/path values"
+fi
+
+if [ "$GC_ONLY" -eq 1 ] && [ "$QUICK_MODE" -eq 1 ]; then
+  _exit_error "--quick cannot be combined with --gc-only"
+fi
+
+if [ "$QUICK_MODE" -eq 1 ]; then
+  if [ "$selector_count" -eq 0 ]; then
+    CLEANUP_SYSTEM=1
+    selector_count=1
+    QUICK_DEFAULTED_SYSTEM=1
+  fi
+
+  if [ "$GC_ONLY" -eq 0 ] && [ "$GC_MODE_SET" -eq 0 ]; then
+    RUN_GC=0
+    QUICK_DEFAULTED_NO_GC=1
+  fi
+fi
+
+if [ "$selector_count" -eq 0 ] && [ -z "$ADD_CRON_ENTRY" ]; then
+  _help
+  exit 1
 fi
 
 if [ -n "$ADD_CRON_ENTRY" ]; then
@@ -571,28 +888,42 @@ if [ -n "$ADD_CRON_ENTRY" ]; then
   exit $?
 fi
 
+if [ "$GC_ONLY" -eq 1 ]; then
+  _run_gc
+  echo "Garbage collection complete."
+  exit 0
+fi
+
+discovery_start=$(_now_epoch)
+candidates_file=$(mktemp)
+
+if [ "$QUICK_DEFAULTED_SYSTEM" -eq 1 ]; then
+  echo "Quick mode default: using --system target."
+fi
+if [ "$QUICK_DEFAULTED_NO_GC" -eq 1 ]; then
+  echo "Quick mode default: skipping final GC (--no-gc)."
+fi
+
 if [ -n "$OLDER_THAN" ]; then
-  _cleanup_older_than "$OLDER_THAN"
-  exit $?
+  _candidates_older_than "$OLDER_THAN" "$candidates_file"
+elif [ "$CLEANUP_SYSTEM" -eq 1 ]; then
+  _candidates_system "$candidates_file"
+else
+  if _all_are_store_paths "${POSITIONAL_ARGS[@]}"; then
+    _candidates_store_paths "$candidates_file" "${POSITIONAL_ARGS[@]}"
+  else
+    if [ "${#POSITIONAL_ARGS[@]}" -gt 1 ]; then
+      rm -f "$candidates_file"
+      _exit_error "expected one flake package name or one/more /nix/store/path values"
+    fi
+    _candidates_package "${POSITIONAL_ARGS[0]}" "$candidates_file"
+  fi
 fi
 
-if [ "$CLEANUP_SYSTEM" -eq 1 ]; then
-  _nix_cleanup_system
-  exit $?
-fi
+discovery_end=$(_now_epoch)
+discovery_seconds=$((discovery_end - discovery_start))
 
-if [ "${#POSITIONAL_ARGS[@]}" -eq 0 ]; then
-  _help
-  exit 1
-fi
-
-if _all_are_store_paths "${POSITIONAL_ARGS[@]}"; then
-  _cleanup_store_paths "${POSITIONAL_ARGS[@]}"
-  exit $?
-fi
-
-if [ "${#POSITIONAL_ARGS[@]}" -gt 1 ]; then
-  _exit_error "expected one flake package name or one/more /nix/store/path values"
-fi
-
-_cleanup_package "${POSITIONAL_ARGS[0]}"
+_run_cleanup_pipeline "$candidates_file" "$discovery_seconds"
+status=$?
+rm -f "$candidates_file"
+exit "$status"
