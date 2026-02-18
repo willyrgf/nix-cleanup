@@ -76,6 +76,7 @@
           inherit nix-cleanup;
           default = nix-cleanup;
         };
+        defaultPackage = nix-cleanup;
 
         apps.default = {
           type = "app";
