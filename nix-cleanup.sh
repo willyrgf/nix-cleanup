@@ -10,19 +10,57 @@ _arg0(){
 }
 
 _help(){
-  printf "
-Usage: $(_arg0) [--system]
-\t[--older-than 30d]
-\t[flake-pkg-name]
-\t[/nix/store/path ...]
-\t--system\t\tcleans up the whole nix-store (nix state)
-\t--older-than\t\tcleans up nix-store paths older than the provided duration (example: 30d)
-\tflake-pkg-name\t\tcleans up everything related to this package on the nix-store
-\tnix-store-path\t\tcleans up everything related to one or more nix-store paths
-"
+  cat <<EOF
+nix-cleanup - clean dead nix store paths safely
+
+Usage:
+  $(_arg0) [--yes] [--system]
+  $(_arg0) [--yes] [--older-than 30d]
+  $(_arg0) [--yes] [flake-pkg-name]
+  $(_arg0) [--yes] [/nix/store/path ...]
+  $(_arg0) --add-cron COMMAND_OR_CRON_ENTRY
+  $(_arg0) -h | --help
+
+Options:
+  -y, --yes
+      Skip deletion confirmation prompts.
+  --system
+      Clean the whole nix store state.
+  --older-than <duration>
+      Clean store paths older than the provided duration.
+      Format: <number>d (example: 30d).
+  --add-cron <command-or-cron-entry>
+      Add an entry to root's crontab (sudo required).
+      Full cron entries are installed as-is.
+      Plain commands are stored as: @daily <command>.
+  -h, --help
+      Show this help text.
+
+Arguments:
+  flake-pkg-name
+      Clean everything related to one flake package.
+  /nix/store/path ...
+      Clean one or more explicit nix store paths.
+
+Notes:
+  - --add-cron cannot be combined with cleanup options or arguments.
+  - --older-than cannot be combined with package/store path arguments.
+  - Non --system cleanup prompts for confirmation before deleting.
+
+Examples:
+  $(_arg0) --older-than 30d
+  $(_arg0) hello
+  $(_arg0) /nix/store/hash-a /nix/store/hash-b
+  $(_arg0) --add-cron "$(_arg0) --older-than 30d"
+  $(_arg0) --add-cron "0 3 * * * $(_arg0) --older-than 30d"
+EOF
 }
 
 _confirm_deletion(){
+  if [ "${ASSUME_YES}" -eq 1 ]; then
+    return 0
+  fi
+
   if [ "${CLEANUP_SYSTEM}" -ne 1 ]; then
     read -r -p "Are you sure you want to delete these paths? (y/N): " reply
     if [[ ! "$reply" =~ ^[Yy]$ ]]; then
@@ -281,6 +319,85 @@ _duration_to_days(){
   return 1
 }
 
+_valid_cron_entry() {
+  local cron_entry=$1
+  local field1
+  local field2
+  local field3
+  local field4
+  local field5
+  local command
+
+  if [[ "$cron_entry" =~ ^@[[:alnum:]_-]+[[:space:]]+.+$ ]]; then
+    return 0
+  fi
+
+  read -r field1 field2 field3 field4 field5 command <<< "$cron_entry"
+  if [ -z "$field1" ] || [ -z "$field2" ] || [ -z "$field3" ] || [ -z "$field4" ] || [ -z "$field5" ] || [ -z "$command" ]; then
+    return 1
+  fi
+
+  return 0
+}
+
+_normalize_cron_entry() {
+  local value=$1
+
+  if [ -z "$value" ]; then
+    return 1
+  fi
+
+  if _valid_cron_entry "$value"; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  printf '@daily %s\n' "$value"
+  return 0
+}
+
+_add_cron_entry() {
+  local value=$1
+  local cron_entry
+  local existing_crontab_file
+  local merged_crontab_file
+
+  if ! command -v crontab > /dev/null 2>&1; then
+    _exit_error "package required for --add-cron: crontab"
+  fi
+
+  if ! cron_entry=$(_normalize_cron_entry "$value"); then
+    _exit_error "--add-cron requires a command or cron entry"
+  fi
+
+  _ensure_sudo_session
+
+  existing_crontab_file=$(mktemp)
+  merged_crontab_file=$(mktemp)
+
+  if ! sudo -H crontab -l > "$existing_crontab_file" 2>/dev/null; then
+    : > "$existing_crontab_file"
+  fi
+
+  if grep -Fqx -- "$cron_entry" "$existing_crontab_file"; then
+    echo "Cron entry already exists in root crontab."
+    rm -f "$existing_crontab_file" "$merged_crontab_file"
+    return 0
+  fi
+
+  cp "$existing_crontab_file" "$merged_crontab_file"
+  printf '%s\n' "$cron_entry" >> "$merged_crontab_file"
+
+  if ! sudo -H crontab "$merged_crontab_file"; then
+    rm -f "$existing_crontab_file" "$merged_crontab_file"
+    _exit_error "failed to install cron entry"
+  fi
+
+  rm -f "$existing_crontab_file" "$merged_crontab_file"
+  echo "Installed cron entry in root crontab:"
+  echo "$cron_entry"
+}
+
 _nix_cleanup_system() {
   local all_paths_file
   all_paths_file=$(mktemp)
@@ -367,6 +484,8 @@ _all_are_store_paths() {
 
 export CLEANUP_SYSTEM=0
 OLDER_THAN=""
+ADD_CRON_ENTRY=""
+ASSUME_YES=0
 POSITIONAL_ARGS=()
 SUDO_READY=0
 
@@ -388,6 +507,10 @@ while [ $# -gt 0 ]; do
       _help
       exit 0
       ;;
+    -y|--yes)
+      ASSUME_YES=1
+      shift
+      ;;
     --system)
       CLEANUP_SYSTEM=1
       shift
@@ -401,6 +524,21 @@ while [ $# -gt 0 ]; do
       ;;
     --older-than=*)
       OLDER_THAN="${1#*=}"
+      shift
+      ;;
+    --add-cron)
+      shift
+      if [ $# -eq 0 ]; then
+        _exit_error "--add-cron requires a command or cron entry"
+      fi
+      ADD_CRON_ENTRY="$*"
+      break
+      ;;
+    --add-cron=*)
+      ADD_CRON_ENTRY="${1#*=}"
+      if [ -z "$ADD_CRON_ENTRY" ]; then
+        _exit_error "--add-cron requires a command or cron entry"
+      fi
       shift
       ;;
     --)
@@ -422,6 +560,15 @@ done
 
 if [ -n "$OLDER_THAN" ] && [ "${#POSITIONAL_ARGS[@]}" -gt 0 ]; then
   _exit_error "--older-than cannot be combined with package/store path arguments"
+fi
+
+if [ -n "$ADD_CRON_ENTRY" ] && { [ "$CLEANUP_SYSTEM" -eq 1 ] || [ -n "$OLDER_THAN" ] || [ "${#POSITIONAL_ARGS[@]}" -gt 0 ]; }; then
+  _exit_error "--add-cron cannot be combined with cleanup options/arguments"
+fi
+
+if [ -n "$ADD_CRON_ENTRY" ]; then
+  _add_cron_entry "$ADD_CRON_ENTRY"
+  exit $?
 fi
 
 if [ -n "$OLDER_THAN" ]; then
