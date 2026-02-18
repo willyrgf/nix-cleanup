@@ -8,6 +8,53 @@
 nix run 'github:willyrgf/nix-cleanup' -- --help
 ```
 
+The packaged app is wrapped with a pinned runtime `PATH` so `nix run` does not
+depend on ambient host tooling for core commands.
+
+## Runtime Dependencies
+
+Runtime tools are bundled in the app closure and checked at startup:
+- `nix`, `nix-store`, `nix-collect-garbage`
+- `find`, `xargs`, `mktemp`, `awk`, `grep`
+- `cp`, `mv`, `rm`, `cat`, `sleep`, `date`
+- `git`, `crontab` (required globally by policy)
+
+Feature-specific host dependency:
+- `sudo` is validated when a privileged operation is executed.
+
+## Deterministic Quality Gates
+
+All quality checks are Nix-packaged and pinned by `flake.lock`. CI and local
+development should use the same canonical command:
+
+```bash
+nix flake check --print-build-logs --show-trace
+```
+
+`nix flake check` runs:
+- Bash syntax check (`bash -n`)
+- Shell lint (`shellcheck`)
+- Formatting check (`shfmt -d`)
+- GitHub Actions lint (`actionlint`)
+- Nix lint (`statix`, `deadnix`)
+- CLI behavior tests (`bats tests/cli.bats`)
+
+For interactive local iteration, use the pinned toolchain shell:
+
+```bash
+nix develop
+```
+
+Additional deterministic shells:
+
+```bash
+# Runtime-only commands
+nix develop .#runtime
+
+# Runtime + quality tooling
+nix develop .#quality
+```
+
 ## Usage
 
 ```text
@@ -109,4 +156,14 @@ nix run .#nix-cleanup -- --add-cron "nix-cleanup --quick --gc --yes --jobs 4"
 
 ```bash
 nix run .#nix-cleanup -- --add-cron "0 3 * * * nix-cleanup --quick --gc --yes --jobs 4"
+```
+
+## Lockfile Policy
+
+- `flake.lock` is the source of truth for tool and dependency versions.
+- Update lock inputs only through explicit maintenance changes.
+- After any lock update, run:
+
+```bash
+nix flake check --print-build-logs --show-trace
 ```

@@ -6,6 +6,11 @@ _exit_error() {
 }
 
 _arg0() {
+  if [ -n "${NIX_CLEANUP_ARG0:-}" ]; then
+    printf '%s\n' "$NIX_CLEANUP_ARG0"
+    return
+  fi
+
   printf '%s\n' "${0##*/}"
 }
 
@@ -18,7 +23,7 @@ _flake_commit() {
 
   if [ "$commit" = "__NIX_CLEANUP_FLAKE_COMMIT__" ]; then
     if command -v git > /dev/null 2>&1; then
-      commit=$(git rev-parse --short=12 HEAD 2>/dev/null || true)
+      commit=$(git rev-parse --short=12 HEAD 2> /dev/null || true)
     else
       commit=""
     fi
@@ -32,7 +37,7 @@ _flake_commit() {
 }
 
 _help() {
-  cat <<EOF
+  cat << EOF
 nix-cleanup - clean dead nix store paths safely
 Flake commit: $(_flake_commit)
 
@@ -100,15 +105,20 @@ EOF
 
 _count_lines() {
   local file=$1
-  local count
 
   if [ ! -f "$file" ]; then
     echo "0"
     return
   fi
 
-  count=$(wc -l < "$file")
-  echo "${count//[[:space:]]/}"
+  awk 'END { print NR + 0 }' "$file"
+}
+
+_print_first_lines() {
+  local file=$1
+  local limit=${2:-20}
+
+  awk -v limit="$limit" 'NR <= limit { print }' "$file"
 }
 
 _now_epoch() {
@@ -135,7 +145,7 @@ _print_preview() {
   fi
 
   echo "$label (${count}):"
-  sed -n '1,20p' "$file"
+  _print_first_lines "$file" 20
   if [ "$count" -gt 20 ]; then
     echo "... and $((count - 20)) more"
   fi
@@ -161,6 +171,10 @@ _ensure_sudo_session() {
     return 0
   fi
 
+  if ! command -v sudo > /dev/null 2>&1; then
+    _exit_error "package required for cleanup operations: sudo"
+  fi
+
   sudo -v || _exit_error "sudo authentication failed"
   SUDO_READY=1
 }
@@ -168,7 +182,7 @@ _ensure_sudo_session() {
 _cpu_count() {
   local count
 
-  count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+  count=$(getconf _NPROCESSORS_ONLN 2> /dev/null || true)
   if [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -gt 0 ]; then
     echo "$count"
     return
@@ -211,6 +225,7 @@ _list_dead_paths() {
 
   : > "$output_file"
   _ensure_sudo_session
+  # shellcheck disable=SC2024
   if ! sudo -H "$NIX_STORE_BIN" --gc --print-dead > "$output_file"; then
     _exit_error "failed to query dead store paths"
   fi
@@ -259,7 +274,7 @@ _collect_existing_paths() {
     return
   fi
 
-  xargs -r -n 256 -P "$JOBS" find -maxdepth 0 -print < "$input_file" > "$output_file" 2>/dev/null || true
+  xargs -r -n 256 -P "$JOBS" find -maxdepth 0 -print < "$input_file" > "$output_file" 2> /dev/null || true
   _dedupe_file_inplace "$output_file"
 }
 
@@ -327,7 +342,7 @@ _delete_quick() {
 
   if [ -s "$log_file" ] && [ "$DELETE_RESULT_UNRESOLVED" -gt 0 ]; then
     echo "Delete output (first 20 lines):"
-    sed -n '1,20p' "$log_file"
+    _print_first_lines "$log_file" 20
   fi
 
   rm -f "$remaining_file" "$log_file"
@@ -470,7 +485,7 @@ _candidates_older_than() {
   : > "$output_file"
   if [ -s "$dead_file" ]; then
     echo "Discovering dead candidates older than ${older_than}..."
-    xargs -r -n 64 -P "$JOBS" find -maxdepth 0 -mtime +"$days" -print < "$dead_file" > "$output_file" 2>/dev/null || true
+    xargs -r -n 64 -P "$JOBS" find -maxdepth 0 -mtime +"$days" -print < "$dead_file" > "$output_file" 2> /dev/null || true
     _dedupe_file_inplace "$output_file"
   fi
 
@@ -490,7 +505,7 @@ _candidates_package() {
   local store_path
   local referrers_file
 
-  store_path=$("$NIX_BIN" path-info ".#$package_name" 2>/dev/null || true)
+  store_path=$("$NIX_BIN" path-info ".#$package_name" 2> /dev/null || true)
   if [ -z "$store_path" ]; then
     _exit_error "package not found: $package_name"
   fi
@@ -728,7 +743,8 @@ _add_cron_entry() {
   existing_crontab_file=$(mktemp)
   merged_crontab_file=$(mktemp)
 
-  if ! sudo -H crontab -l > "$existing_crontab_file" 2>/dev/null; then
+  # shellcheck disable=SC2024
+  if ! sudo -H crontab -l > "$existing_crontab_file" 2> /dev/null; then
     : > "$existing_crontab_file"
   fi
 
@@ -755,14 +771,19 @@ _required_packages=(
   "nix"
   "nix-store"
   "nix-collect-garbage"
+  "git"
+  "crontab"
   "find"
   "xargs"
   "mktemp"
   "awk"
-  "wc"
-  "sed"
+  "grep"
+  "cp"
+  "mv"
+  "rm"
+  "cat"
+  "sleep"
   "date"
-  "getconf"
 )
 
 for req in "${_required_packages[@]}"; do
@@ -798,11 +819,11 @@ fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -h|--help)
+    -h | --help)
       _help
       exit 0
       ;;
-    -y|--yes)
+    -y | --yes)
       ASSUME_YES=1
       shift
       ;;

@@ -5,10 +5,15 @@ on:
   pull_request:
 
 jobs:
-  nix_checks: 
-    runs-on: ubuntu-latest
+  flake_checks:
+    name: Flake checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
     permissions:
       id-token: write
       contents: read
@@ -24,23 +29,26 @@ jobs:
           extra_nix_config: |
             sandbox = true # force sandbox for all OS (normally disabled for macOS)
 
-      - name: Validate shell syntax
-        run: bash -n nix-cleanup.sh
+      - name: Run flake checks
+        run: nix flake check --print-build-logs --show-trace
 
-      - name: Validate help output
-        run: nix run --print-build-logs --show-trace '.#nix-cleanup' -- --help
+  disposable_store_path:
+    name: Disposable store path cleanup (ubuntu-latest)
+    runs-on: ubuntu-latest
+    needs: flake_checks
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@cd7d8d697e10461458bc61a30d094dc601a8b017 #v4
 
-      - name: Validate argument parsing
-        run: |
-          set +e
-          nix run --print-build-logs --show-trace '.#nix-cleanup' -- --older-than bad
-          status=$?
-          set -e
-
-          if [ "$status" -eq 0 ]; then
-            echo "Expected --older-than bad to fail."
-            exit 1
-          fi
+      - uses: cachix/install-nix-action@8887e596b4ee1134dae06b98d573bd674693f47c #v26
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            sandbox = true # force sandbox for all OS (normally disabled for macOS)
 
       - name: Delete a disposable store path
         run: |
@@ -54,7 +62,7 @@ jobs:
             exit 1
           fi
 
-          fixture_expr='let pkgs = import <nixpkgs> {}; in pkgs.runCommand "nix-cleanup-ci-fixture" {} "echo fixture > $out"'
+          fixture_expr="let pkgs = import <nixpkgs> {}; in pkgs.runCommand \"nix-cleanup-ci-fixture\" {} \"echo fixture > \\$out\""
           nix build --print-build-logs --show-trace --impure --out-link ci-gc-fixture --expr "$fixture_expr"
 
           store_path="$(readlink -f ci-gc-fixture)"
@@ -75,7 +83,7 @@ jobs:
           fi
 
           for attempt in 1 2 3; do
-            printf 'y\n' | "$cleanup_bin" "$store_path"
+            "$cleanup_bin" --yes "$store_path"
             if [ ! -e "$store_path" ]; then
               break
             fi
